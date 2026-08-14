@@ -211,6 +211,16 @@ export interface TakePhotoOptions {
    * @since 8.1.0
    */
   includeMetadata?: boolean;
+
+  /**
+   * Whether to capture the device's current GPS location and embed it as GPS EXIF metadata in the returned photo.
+   * Triggers the system location permission prompt on first use. If permission is denied, location services are
+   * disabled, or a location can't be resolved quickly, the photo is still returned normally, without GPS metadata -
+   * this option never blocks or fails photo capture.
+   * Note: This option is only supported on iOS.
+   * @default false
+   */
+  includeLocation?: boolean;
 }
 
 export interface RecordVideoOptions {
@@ -507,6 +517,9 @@ export interface MediaMetadata {
    * Exif data, if any, retrieved from the media item.
    * Only available for `MediaType.Photo`.
    * Not available on Web.
+   *
+   * On iOS, when `includeLocation` was set on `TakePhotoOptions`, this includes a `GPS` entry with the embedded
+   * location, provided a fix was available at capture time.
    *
    * @since 8.1.0
    */

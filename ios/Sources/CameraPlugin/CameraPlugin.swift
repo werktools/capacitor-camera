@@ -1,6 +1,7 @@
 import Foundation
 import IONCameraLib
 import Capacitor
+import CoreLocation
 import Photos
 import PhotosUI
 import ImageIO
@@ -34,8 +35,12 @@ public class CameraPlugin: CAPPlugin, CAPBridgedPlugin {
     private lazy var editManager = IONCAMRFactory.createEditManagerWrapper(withDelegate: self, and: self.bridge?.viewController ?? UIViewController())
     private lazy var videoManager = IONCAMRFactory.createVideoManagerWrapper(withDelegate: self, and: self.bridge?.viewController ?? UIViewController())
 
+    /// Resolves a one-shot device location for photos taken with `includeLocation` set. IONCameraLib's `IONCAMRTakePhotoOptions` has no
+    /// concept of location, so this is handled entirely at the plugin layer: requested in `takePhoto`, consumed in `callback(result:)`.
+    private let locationProvider = CameraLocationProvider()
+    private var pendingLocation: CLLocation?
     private var imageCounter = 0
-    
+
     public override func load() {
         NotificationCenter.default.addObserver(
             self,
@@ -78,6 +83,16 @@ public class CameraPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func takePhoto(_ call: CAPPluginCall) {
+        // includeLocation isn't a field IONCameraLib's IONCAMRTakePhotoOptions knows about, so it's read directly off the raw call
+        // options here rather than through the decoded struct. Requested in parallel with capture so it adds no latency: by the time
+        // the photo is taken (and possibly edited), the location fix has typically already resolved.
+        pendingLocation = nil
+        if call.getBool("includeLocation", false) {
+            locationProvider.requestLocation { [weak self] location in
+                self?.pendingLocation = location
+            }
+        }
+
         handleCall(call, error: .takePictureArguments) { (options: IONCAMRTakePhotoOptions) in
             self.cameraManager.takePhoto(with: options)
         }
@@ -666,11 +681,32 @@ extension CameraPlugin: IONCAMRCallbackDelegate {
     }
 
     public func callback(result: IONCAMRMediaResult) {
+        if result.type == .picture, let location = pendingLocation {
+            CAPLog.print("⚡️ ", self.pluginId, "- EXIF callback", location, result.metadata?.creationDate ?? Date.now)
+            embedLocation(location, creationDate: result.metadata?.creationDate ?? Date.now, intoPhotoAt: result.uri)
+        }
+        pendingLocation = nil
         resolve(result)
     }
 
     public func callback(result: [IONCAMRMediaResult]) {
         resolve(["results": result])
+    }
+
+    /// Rewrites the photo file at `uri` in place with a GPS EXIF dictionary embedded, via `Data.taggingGPSLocationAndTime(_:)`. Once this succeeds,
+    /// `resolveExif(from:)` below picks the GPS data up automatically when it reads the same file back off disk - no further plumbing needed.
+    ///
+    /// Best-effort: `uri` may be empty (e.g. base64-only results with no backing file) or the write may fail for any reason - either case is
+    /// silently ignored rather than turning a successful capture into a failed one.
+    private func embedLocation(_ location: CLLocation, creationDate: Date, intoPhotoAt uri: String) {
+        guard !uri.isEmpty, let fileURL = URL(string: uri) else { return }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            try data.taggingGPSLocationAndTime(location, creationDate: creationDate).write(to: fileURL, options: .atomic)
+        } catch {
+            // Best-effort - see doc comment above.
+        }
     }
 
     private func resolve<T: Encodable>(_ value: T) {
@@ -730,8 +766,10 @@ extension CameraPlugin: IONCAMRCallbackDelegate {
             return nil
         }
         var exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+        CAPLog.print("⚡️ ", self.pluginId, "- EXIF resolveExif before", exif)
         exif["Orientation"] = properties[kCGImagePropertyOrientation as String]
         exif["GPS"] = properties[kCGImagePropertyGPSDictionary as String]
+        CAPLog.print("⚡️ ", self.pluginId, "- EXIF resolveExif after", exif)
         return exif.isEmpty ? nil : exif
     }
 }
